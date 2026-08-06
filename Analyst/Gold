@@ -1,0 +1,251 @@
+-- ============================================================
+--  LAYER 3 - GOLD: satu view per pertanyaan analisis
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- #1 KYC FUNNEL: berapa nasabah yang beneran verified?
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q1_kyc_funnel AS
+SELECT
+    kyc_status,
+    COUNT(*)                                     AS jml_nasabah,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct
+FROM silver.customers
+GROUP BY kyc_status
+ORDER BY jml_nasabah DESC;
+
+CREATE OR REPLACE VIEW gold.vw_q1_kyc_per_kota AS
+SELECT
+    city,
+    COUNT(*)                                          AS total_nasabah,
+    COUNT(*) FILTER (WHERE kyc_status = 'verified')   AS verified,
+    ROUND(COUNT(*) FILTER (WHERE kyc_status = 'verified') * 100.0
+          / COUNT(*), 2)                              AS pct_verified
+FROM silver.customers
+GROUP BY city
+HAVING COUNT(*) >= 30
+ORDER BY pct_verified ASC;
+
+-- ------------------------------------------------------------
+-- #2 KATEGORI BELANJA (hanya transaksi success!)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q2_kategori_belanja AS
+SELECT
+    merchant_category,
+    COUNT(*)                                     AS jml_trx,
+    SUM(amount_idr)                              AS total_nilai_idr,
+    ROUND(AVG(amount_idr), 0)                    AS avg_nilai_idr,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS share_trx_pct
+FROM silver.transactions
+WHERE is_success
+GROUP BY merchant_category
+ORDER BY jml_trx DESC;
+
+-- ------------------------------------------------------------
+-- #3 CHANNEL MIX
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q3_channel_mix AS
+SELECT
+    channel,
+    COUNT(*)                                     AS jml_trx_semua,
+    COUNT(*) FILTER (WHERE is_success)           AS jml_trx_sukses,
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS share_pct,
+    ROUND(AVG(amount_idr), 0)                    AS avg_amount_idr
+FROM silver.transactions
+GROUP BY channel
+ORDER BY jml_trx_semua DESC;
+
+-- ------------------------------------------------------------
+-- #4 TREN GMV BULANAN + MoM GROWTH (window LAG)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q4_gmv_bulanan AS
+SELECT
+    DATE_TRUNC('month', trx_date)                AS bulan,
+    COUNT(*)                                     AS jml_trx,
+    SUM(amount_idr)                              AS gmv_idr,
+    ROUND(AVG(amount_idr), 0)                    AS avg_ticket_idr,
+    ROUND((SUM(amount_idr) - LAG(SUM(amount_idr)) OVER (ORDER BY DATE_TRUNC('month', trx_date)))
+          * 100.0 / NULLIF(LAG(SUM(amount_idr)) OVER (ORDER BY DATE_TRUNC('month', trx_date)), 0), 2)
+                                                 AS mom_growth_pct
+FROM silver.transactions
+WHERE is_success                                  -- failed = duit tidak pindah
+GROUP BY bulan
+ORDER BY bulan;
+
+-- ------------------------------------------------------------
+-- #5 AUM PER TIER + TIER-MISMATCH (hanya akun active)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q5_aum_per_tier AS
+SELECT
+    tier,
+    COUNT(*)                                     AS jml_akun,
+    ROUND(AVG(balance_idr), 0)                   AS avg_saldo_idr,
+    SUM(balance_idr)                             AS total_aum_idr
+FROM silver.accounts
+WHERE status = 'active'
+GROUP BY tier
+ORDER BY CASE tier WHEN 'basic' THEN 1 WHEN 'silver' THEN 2
+                   WHEN 'gold' THEN 3 ELSE 4 END;
+
+CREATE OR REPLACE VIEW gold.vw_q5_tier_mismatch AS
+SELECT
+    a.account_id, a.customer_id, c.name, a.tier, a.balance_idr, a.balance_segment,
+    CASE
+        WHEN a.tier IN ('basic','silver') AND a.balance_segment = 'affluent' THEN 'kandidat_upgrade'
+        WHEN a.tier = 'platinum'          AND a.balance_segment = 'mass'     THEN 'kandidat_downgrade'
+    END AS rekomendasi
+FROM silver.accounts a
+JOIN silver.customers c USING (customer_id)
+WHERE a.status = 'active'
+  AND ((a.tier IN ('basic','silver') AND a.balance_segment = 'affluent')
+    OR (a.tier = 'platinum' AND a.balance_segment = 'mass'))
+ORDER BY a.balance_idr DESC;
+
+CREATE OR REPLACE VIEW gold.vw_q5_crosstab_segment_tier AS
+SELECT
+    balance_segment, tier, COUNT(*) AS jml_akun
+FROM silver.accounts
+WHERE status = 'active'
+GROUP BY balance_segment, tier;
+
+-- ------------------------------------------------------------
+-- #6 POLA TRANSAKSI GAGAL (channel x tipe x jam)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q6_failure_per_dimensi AS
+SELECT 'channel' AS dimensi, channel AS nilai,
+    COUNT(*) AS jml_trx,
+    ROUND(COUNT(*) FILTER (WHERE NOT is_success) * 100.0 / COUNT(*), 2) AS failure_rate_pct
+FROM silver.transactions GROUP BY channel
+UNION ALL
+SELECT 'trx_type', trx_type, COUNT(*),
+    ROUND(COUNT(*) FILTER (WHERE NOT is_success) * 100.0 / COUNT(*), 2)
+FROM silver.transactions GROUP BY trx_type
+UNION ALL
+SELECT 'jam_band', jam_band, COUNT(*),
+    ROUND(COUNT(*) FILTER (WHERE NOT is_success) * 100.0 / COUNT(*), 2)
+FROM silver.transactions GROUP BY jam_band
+ORDER BY dimensi, failure_rate_pct DESC;
+
+CREATE OR REPLACE VIEW gold.vw_q6_failure_kombinasi AS
+SELECT
+    channel, jam_band,
+    COUNT(*)                                     AS jml_trx,
+    ROUND(COUNT(*) FILTER (WHERE NOT is_success) * 100.0 / COUNT(*), 2) AS failure_rate_pct
+FROM silver.transactions
+GROUP BY channel, jam_band
+HAVING COUNT(*) >= 100
+ORDER BY failure_rate_pct DESC;
+
+-- ------------------------------------------------------------
+-- #7 NPL PER JENIS PINJAMAN
+--    NPL by count DAN by outstanding (dua sudut pandang)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q7_npl_per_loan_type AS
+SELECT
+    loan_type,
+    COUNT(*)                                     AS jml_pinjaman,
+    SUM(principal_idr)                           AS total_principal_idr,
+    SUM(outstanding_idr)                         AS total_outstanding_idr,
+    ROUND(COUNT(*) FILTER (WHERE is_npl) * 100.0 / COUNT(*), 2)  AS npl_by_count_pct,
+    ROUND(SUM(outstanding_idr) FILTER (WHERE is_npl) * 100.0
+          / NULLIF(SUM(outstanding_idr), 0), 2)                  AS npl_by_outstanding_pct
+FROM silver.loans
+GROUP BY loan_type
+ORDER BY npl_by_outstanding_pct DESC;
+
+-- ------------------------------------------------------------
+-- #8 REFERRAL vs DIRECT (COALESCE + multi-JOIN + cohort)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q8_referral_vs_direct AS
+SELECT
+    c.acquisition_channel,
+    COUNT(DISTINCT c.customer_id)                AS jml_nasabah,
+    COUNT(t.trx_id)                              AS jml_trx,
+    ROUND(COUNT(t.trx_id) * 1.0
+          / COUNT(DISTINCT c.customer_id), 2)    AS trx_per_nasabah,
+    ROUND(AVG(t.amount_idr), 0)                  AS avg_amount_idr
+FROM silver.customers c
+LEFT JOIN silver.accounts a      USING (customer_id)
+LEFT JOIN silver.transactions t  ON t.account_id = a.account_id AND t.is_success
+GROUP BY c.acquisition_channel;
+
+CREATE OR REPLACE VIEW gold.vw_q8_cohort_90hari AS
+SELECT
+    c.acquisition_channel,
+    CASE WHEN t.trx_date - c.registration_date <= 90
+         THEN '0-90 hari' ELSE '>90 hari' END    AS periode,
+    ROUND(COUNT(t.trx_id) * 1.0
+          / COUNT(DISTINCT c.customer_id), 2)    AS trx_per_nasabah
+FROM silver.customers c
+JOIN silver.accounts a     USING (customer_id)
+JOIN silver.transactions t ON t.account_id = a.account_id AND t.is_success
+GROUP BY c.acquisition_channel, periode
+ORDER BY periode, c.acquisition_channel;
+
+-- ------------------------------------------------------------
+-- #9 LOAN RISK: vintage + cross-product kartu kredit
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q9_vintage AS
+SELECT
+    vintage_year,
+    COUNT(*)                                     AS jml_pinjaman,
+    ROUND(COUNT(*) FILTER (WHERE is_npl) * 100.0 / COUNT(*), 2) AS npl_rate_pct
+FROM silver.loans
+GROUP BY vintage_year
+ORDER BY vintage_year;
+
+CREATE OR REPLACE VIEW gold.vw_q9_cross_loan_card AS
+SELECT
+    l.customer_id, c.name, l.loan_type, l.status AS loan_status,
+    l.outstanding_idr AS loan_outstanding_idr,
+    k.utilization_pct AS cc_utilization_pct,
+    CASE WHEN l.is_npl AND k.utilization_pct > 80 THEN 'DOUBLE_RISK'
+         WHEN l.is_npl                            THEN 'loan_npl'
+         WHEN k.utilization_pct > 80              THEN 'cc_high_util'
+    END AS risk_flag
+FROM silver.loans l
+JOIN silver.cards k USING (customer_id)
+JOIN silver.customers c ON c.customer_id = l.customer_id
+WHERE k.card_type = 'credit'
+  AND (l.is_npl OR k.utilization_pct > 80)
+ORDER BY risk_flag, k.utilization_pct DESC;
+
+-- ------------------------------------------------------------
+-- #10 FINANCIAL HEALTH: KPI eksekutif + proxy CLV top 20%
+--     CLV = 0.4*saldo aktif + 0.4*nilai transaksi + 0.2*loan aktif
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW gold.vw_q10_kpi_eksekutif AS
+SELECT
+    (SELECT COUNT(*) FROM silver.customers)                                   AS total_nasabah,
+    (SELECT ROUND(COUNT(*) FILTER (WHERE kyc_status='verified')*100.0/COUNT(*),2)
+       FROM silver.customers)                                                 AS pct_kyc_verified,
+    (SELECT SUM(balance_idr) FROM silver.accounts WHERE status='active')      AS total_aum_idr,
+    (SELECT ROUND(COUNT(*) FILTER (WHERE is_success)*100.0/COUNT(*),2)
+       FROM silver.transactions)                                              AS trx_success_rate_pct,
+    (SELECT SUM(amount_idr) FROM silver.transactions WHERE is_success)        AS total_gmv_idr,
+    (SELECT SUM(outstanding_idr) FROM silver.loans WHERE status='active')     AS loan_outstanding_aktif_idr;
+
+CREATE OR REPLACE VIEW gold.vw_q10_clv_top20 AS
+WITH nilai AS (
+    SELECT
+        c.customer_id, c.name, c.city,
+        COALESCE(SUM(DISTINCT a.balance_idr) FILTER (WHERE a.status='active'), 0) AS saldo,
+        COALESCE(SUM(t.amount_idr) FILTER (WHERE t.is_success), 0)                AS nilai_trx,
+        COALESCE((SELECT SUM(outstanding_idr) FROM silver.loans l
+                  WHERE l.customer_id = c.customer_id AND l.status='active'), 0)  AS loan_aktif
+    FROM silver.customers c
+    LEFT JOIN silver.accounts a     USING (customer_id)
+    LEFT JOIN silver.transactions t ON t.account_id = a.account_id
+    GROUP BY c.customer_id, c.name, c.city
+),
+skor AS (
+    SELECT *,
+        0.4*saldo + 0.4*nilai_trx + 0.2*loan_aktif AS clv_score,
+        NTILE(5) OVER (ORDER BY 0.4*saldo + 0.4*nilai_trx + 0.2*loan_aktif DESC) AS quintile
+    FROM nilai
+)
+SELECT customer_id, name, city, saldo, nilai_trx, loan_aktif,
+       ROUND(clv_score, 0) AS clv_score
+FROM skor
+WHERE quintile = 1          -- top 20%
+ORDER BY clv_score DESC;
