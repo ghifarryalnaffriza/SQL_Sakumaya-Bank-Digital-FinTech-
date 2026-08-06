@@ -1,0 +1,505 @@
+* =====================================================================
+   SAKUMAYA DIGITAL BANK — SILVER LAYER
+   Financial Health Analytics
+   ===================================================================== */
+-- =====================================================================
+-- Cek kualitas data di Bronze
+-- =====================================================================
+-- =========================================================
+-- bronze.customers
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT customer_id, COUNT(*) AS jml
+FROM bronze.customers
+GROUP BY customer_id
+HAVING COUNT(*) > 1 OR customer_id IS NULL;
+ 
+-- Missing values kolom wajib
+SELECT
+    SUM(CASE WHEN name IS NULL OR name = '' THEN 1 ELSE 0 END)   AS null_name,
+    SUM(CASE WHEN dob IS NULL THEN 1 ELSE 0 END)                 AS null_dob,
+    SUM(CASE WHEN registration_date IS NULL THEN 1 ELSE 0 END)   AS null_reg_date,
+    SUM(CASE WHEN kyc_status IS NULL THEN 1 ELSE 0 END)          AS null_kyc,
+    SUM(CASE WHEN referral_code IS NULL OR referral_code = ''
+             THEN 1 ELSE 0 END)                                  AS kosong_referral
+FROM bronze.customers;   -- referral kosong ~30% = wajar, jadi 'direct'
+ 
+-- Unwanted spaces
+SELECT customer_id
+FROM bronze.customers
+WHERE name     <> TRIM(name)
+   OR city     <> TRIM(city)
+   OR province <> TRIM(province)
+   OR email    <> TRIM(email);
+ 
+-- Standardisasi kolom low-cardinality
+SELECT DISTINCT kyc_status FROM bronze.customers;
+SELECT DISTINCT gender     FROM bronze.customers;
+SELECT DISTINCT province   FROM bronze.customers;
+ 
+-- Outlier / invalid value: umur di luar batas nasabah bank (17-100)
+SELECT customer_id, dob, registration_date
+FROM bronze.customers
+WHERE dob > GETDATE()
+   OR DATEDIFF(YEAR, dob, GETDATE()) NOT BETWEEN 17 AND 100
+   OR registration_date > GETDATE();
+ 
+-- Structural error: registrasi sebelum lahir
+SELECT customer_id, dob, registration_date
+FROM bronze.customers
+WHERE registration_date < dob;
+ 
+-- =========================================================
+-- bronze.accounts
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT account_id, COUNT(*) AS jml
+FROM bronze.accounts
+GROUP BY account_id
+HAVING COUNT(*) > 1 OR account_id IS NULL;
+ 
+-- Standardisasi kolom low-cardinality
+SELECT DISTINCT account_type FROM bronze.accounts;
+SELECT DISTINCT status       FROM bronze.accounts;
+SELECT DISTINCT tier         FROM bronze.accounts;
+ 
+-- Outlier / invalid value: saldo negatif
+SELECT * FROM bronze.accounts WHERE balance_idr < 0;
+ 
+-- Referential integrity: akun -> nasabah
+SELECT DISTINCT a.customer_id
+FROM bronze.accounts a
+WHERE a.customer_id NOT IN (SELECT customer_id FROM bronze.customers);
+ 
+-- Structural error: akun dibuat sebelum nasabah registrasi
+SELECT a.account_id, a.created_date, c.registration_date
+FROM bronze.accounts a
+JOIN bronze.customers c ON a.customer_id = c.customer_id
+WHERE a.created_date < c.registration_date;
+ 
+-- =========================================================
+-- bronze.transactions
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT trx_id, COUNT(*) AS jml
+FROM bronze.transactions
+GROUP BY trx_id
+HAVING COUNT(*) > 1 OR trx_id IS NULL;
+ 
+-- Standardisasi kolom low-cardinality
+SELECT DISTINCT trx_type          FROM bronze.transactions;
+SELECT DISTINCT status            FROM bronze.transactions;
+SELECT DISTINCT channel           FROM bronze.transactions;
+SELECT DISTINCT merchant_category FROM bronze.transactions;
+ 
+-- Outlier / invalid value: nominal & jam tidak wajar
+SELECT COUNT(*) AS amount_invalid FROM bronze.transactions WHERE amount_idr <= 0;
+SELECT MIN(amount_idr) AS min_amount, MAX(amount_idr) AS max_amount FROM bronze.transactions;
+SELECT COUNT(*) AS jam_invalid
+FROM bronze.transactions
+WHERE DATEPART(HOUR, trx_time) NOT BETWEEN 0 AND 23;
+ 
+-- Referential integrity: transaksi -> akun
+SELECT DISTINCT t.account_id
+FROM bronze.transactions t
+WHERE t.account_id NOT IN (SELECT account_id FROM bronze.accounts);
+ 
+-- Structural error: transaksi sebelum akun dibuat / di masa depan
+SELECT t.trx_id, t.trx_date, a.created_date
+FROM bronze.transactions t
+JOIN bronze.accounts a ON t.account_id = a.account_id
+WHERE t.trx_date < a.created_date OR t.trx_date > GETDATE();
+ 
+-- =========================================================
+-- bronze.loans
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT loan_id, COUNT(*) AS jml
+FROM bronze.loans
+GROUP BY loan_id
+HAVING COUNT(*) > 1 OR loan_id IS NULL;
+ 
+-- Standardisasi kolom low-cardinality
+SELECT DISTINCT loan_type FROM bronze.loans;
+SELECT DISTINCT status    FROM bronze.loans;
+ 
+-- Outlier / invalid value
+SELECT *
+FROM bronze.loans
+WHERE principal_idr <= 0
+   OR tenure_months <= 0
+   OR interest_rate_annual NOT BETWEEN 0 AND 1   -- desimal, bukan persen
+   OR outstanding_idr < 0;
+ 
+-- Business logic: outstanding tidak boleh melebihi pokok pinjaman
+SELECT loan_id, principal_idr, outstanding_idr
+FROM bronze.loans
+WHERE outstanding_idr > principal_idr;
+ 
+-- Structural error: urutan tanggal (disbursement <= due, last_payment >= disbursement)
+SELECT loan_id, disbursement_date, due_date, last_payment_date
+FROM bronze.loans
+WHERE due_date < disbursement_date
+   OR last_payment_date < disbursement_date
+   OR disbursement_date > GETDATE();
+ 
+-- Referential integrity: pinjaman -> nasabah
+SELECT DISTINCT l.customer_id
+FROM bronze.loans l
+WHERE l.customer_id NOT IN (SELECT customer_id FROM bronze.customers);
+ 
+-- Business logic: pinjaman hanya untuk nasabah KYC verified
+SELECT l.loan_id, c.kyc_status
+FROM bronze.loans l
+JOIN bronze.customers c ON l.customer_id = c.customer_id
+WHERE c.kyc_status <> 'verified';
+ 
+-- =========================================================
+-- bronze.cards
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT card_id, COUNT(*) AS jml
+FROM bronze.cards
+GROUP BY card_id
+HAVING COUNT(*) > 1 OR card_id IS NULL;
+ 
+-- Standardisasi kolom low-cardinality
+SELECT DISTINCT card_type FROM bronze.cards;
+SELECT DISTINCT status    FROM bronze.cards;
+ 
+-- Business logic: limit & outstanding hanya untuk kartu kredit
+SELECT
+    card_type,
+    COUNT(*)                                                  AS jml,
+    SUM(CASE WHEN credit_limit_idr IS NULL THEN 1 ELSE 0 END) AS limit_null,
+    SUM(CASE WHEN outstanding_idr IS NULL THEN 1 ELSE 0 END)  AS outstanding_null
+FROM bronze.cards
+GROUP BY card_type;   -- ekspektasi: NULL hanya pada card_type = 'debit'
+ 
+-- Outlier: outstanding melebihi limit (over-limit)
+SELECT card_id, credit_limit_idr, outstanding_idr
+FROM bronze.cards
+WHERE card_type = 'credit' AND outstanding_idr > credit_limit_idr;
+ 
+-- Referential integrity: kartu -> nasabah & akun
+SELECT DISTINCT k.customer_id
+FROM bronze.cards k
+WHERE k.customer_id NOT IN (SELECT customer_id FROM bronze.customers);
+ 
+SELECT DISTINCT k.account_id
+FROM bronze.cards k
+WHERE k.account_id NOT IN (SELECT account_id FROM bronze.accounts);
+ 
+-- Konsistensi: kartu & akun harus milik nasabah yang sama
+SELECT k.card_id, k.customer_id AS cust_kartu, a.customer_id AS cust_akun
+FROM bronze.cards k
+JOIN bronze.accounts a ON k.account_id = a.account_id
+WHERE k.customer_id <> a.customer_id;
+GO
+ 
+/* =====================================================================
+   Load Silver
+   ===================================================================== */
+ 
+-- =========================================================
+-- silver.customers
+-- =========================================================
+TRUNCATE TABLE silver.customers;
+ 
+INSERT INTO silver.customers (
+    customer_id, name, nik_masked, email, phone, city, province,
+    dob, gender, kyc_status, registration_date, referral_code,
+    acquisition_channel, age
+)
+SELECT
+    customer_id,
+    TRIM(name),
+    nik_masked,
+    LOWER(TRIM(email)),          -- email disamakan lowercase agar tidak dobel
+    TRIM(phone),
+    TRIM(city),
+    TRIM(province),
+    dob,
+    gender,
+    kyc_status,
+    registration_date,
+    referral_code,
+    -- Asumsi bisnis: referral_code kosong (~30% dataset) = nasabah datang
+    -- sendiri, bukan data hilang
+    CASE WHEN referral_code IS NULL OR TRIM(referral_code) = ''
+         THEN 'direct' ELSE 'referral' END,
+    -- Umur per hari ini; dikurangi 1 bila ulang tahun belum lewat
+    DATEDIFF(YEAR, dob, GETDATE())
+        - CASE WHEN DATEADD(YEAR, DATEDIFF(YEAR, dob, GETDATE()), dob) > GETDATE()
+               THEN 1 ELSE 0 END
+FROM bronze.customers;
+GO
+ 
+-- =========================================================
+-- silver.accounts
+-- =========================================================
+TRUNCATE TABLE silver.accounts;
+ 
+INSERT INTO silver.accounts (
+    account_id, customer_id, account_number, account_type,
+    balance_idr, created_date, status, tier, balance_segment
+)
+SELECT
+    account_id,
+    customer_id,
+    account_number,
+    account_type,
+    balance_idr,
+    created_date,
+    status,
+    tier,
+    -- Segmentasi saldo standar perbankan ritel:
+    -- < 10 jt mass | 10-100 jt mass affluent | > 100 jt affluent
+    CASE
+        WHEN balance_idr < 10000000  THEN 'mass'
+        WHEN balance_idr < 100000000 THEN 'mass_affluent'
+        ELSE 'affluent'
+    END
+FROM bronze.accounts;
+GO
+ 
+-- =========================================================
+-- silver.transactions
+-- =========================================================
+TRUNCATE TABLE silver.transactions;
+ 
+INSERT INTO silver.transactions (
+    trx_id, account_id, trx_type, amount_idr, merchant_name,
+    merchant_category, trx_date, trx_time, trx_hour, jam_band,
+    balance_after_idr, status, channel, is_success
+)
+SELECT
+    trx_id,
+    account_id,
+    trx_type,
+    amount_idr,
+    TRIM(merchant_name),
+    merchant_category,
+    trx_date,
+    trx_time,
+    DATEPART(HOUR, trx_time),
+    -- Band jam untuk analisis pola & failure rate per waktu
+    CASE
+        WHEN DATEPART(HOUR, trx_time) < 6  THEN '00-06'
+        WHEN DATEPART(HOUR, trx_time) < 12 THEN '06-12'
+        WHEN DATEPART(HOUR, trx_time) < 18 THEN '12-18'
+        ELSE '18-24'
+    END,
+    balance_after_idr,
+    status,
+    channel,
+    -- Flag sukses: hanya status 'success' yang dihitung sebagai GMV
+    CASE WHEN status = 'success' THEN 1 ELSE 0 END
+FROM bronze.transactions;
+GO
+ 
+-- =========================================================
+-- silver.loans
+-- =========================================================
+TRUNCATE TABLE silver.loans;
+ 
+INSERT INTO silver.loans (
+    loan_id, customer_id, loan_type, principal_idr, interest_rate_annual,
+    tenure_months, disbursement_date, vintage_year, monthly_installment_idr,
+    outstanding_idr, status, is_npl, due_date, last_payment_date
+)
+SELECT
+    loan_id,
+    customer_id,
+    loan_type,
+    principal_idr,
+    interest_rate_annual,
+    tenure_months,
+    disbursement_date,
+    YEAR(disbursement_date),
+    monthly_installment_idr,
+    outstanding_idr,
+    status,
+    -- Definisi NPL: pinjaman menunggak atau sudah dihapusbukukan
+    CASE WHEN status IN ('overdue', 'written_off') THEN 1 ELSE 0 END,
+    due_date,
+    last_payment_date   -- NULL = belum pernah melakukan pembayaran
+FROM bronze.loans;
+GO
+ 
+-- =========================================================
+-- silver.cards
+-- =========================================================
+TRUNCATE TABLE silver.cards;
+ 
+INSERT INTO silver.cards (
+    card_id, customer_id, account_id, card_type, card_number_masked,
+    expiry_date, status, credit_limit_idr, outstanding_idr, utilization_pct
+)
+SELECT
+    card_id,
+    customer_id,
+    account_id,
+    card_type,
+    card_number_masked,
+    expiry_date,
+    status,
+    credit_limit_idr,
+    outstanding_idr,
+    -- Utilisasi hanya bermakna untuk kartu kredit berlimit; kartu debit NULL.
+    -- NULLIF menjaga dari pembagian nol.
+    CASE WHEN card_type = 'credit' AND credit_limit_idr > 0
+         THEN ROUND(outstanding_idr * 100.0 / NULLIF(credit_limit_idr, 0), 2)
+    END
+FROM bronze.cards;
+GO
+ 
+/* =====================================================================
+   Validasi hasil Silver
+   Ekspektasi: semua query 0 baris / nilai 0, kecuali diberi catatan.
+   ===================================================================== */
+ 
+-- =========================================================
+-- silver.customers
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT customer_id, COUNT(*) AS jml
+FROM silver.customers
+GROUP BY customer_id
+HAVING COUNT(*) > 1 OR customer_id IS NULL;
+ 
+-- Unwanted spaces
+SELECT customer_id
+FROM silver.customers
+WHERE name     <> TRIM(name)
+   OR city     <> TRIM(city)
+   OR province <> TRIM(province);
+ 
+-- Outlier umur
+SELECT * FROM silver.customers WHERE age NOT BETWEEN 17 AND 100;
+ 
+-- Kolom turunan (ekspektasi: 2 nilai, direct + referral, tanpa NULL)
+SELECT acquisition_channel, COUNT(*) AS jml
+FROM silver.customers
+GROUP BY acquisition_channel;
+ 
+-- =========================================================
+-- silver.accounts
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT account_id, COUNT(*) AS jml
+FROM silver.accounts
+GROUP BY account_id
+HAVING COUNT(*) > 1 OR account_id IS NULL;
+ 
+-- Outlier saldo negatif
+SELECT * FROM silver.accounts WHERE balance_idr < 0;
+ 
+-- Referential integrity
+SELECT DISTINCT a.customer_id
+FROM silver.accounts a
+WHERE a.customer_id NOT IN (SELECT customer_id FROM silver.customers);
+ 
+-- Kolom turunan (ekspektasi: 3 segmen, tanpa NULL)
+SELECT balance_segment, COUNT(*) AS jml, MIN(balance_idr) AS min_saldo, MAX(balance_idr) AS max_saldo
+FROM silver.accounts
+GROUP BY balance_segment;
+ 
+-- =========================================================
+-- silver.transactions
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT trx_id, COUNT(*) AS jml
+FROM silver.transactions
+GROUP BY trx_id
+HAVING COUNT(*) > 1 OR trx_id IS NULL;
+ 
+-- Missing values kolom wajib
+SELECT
+    SUM(CASE WHEN trx_date IS NULL THEN 1 ELSE 0 END)   AS null_trx_date,
+    SUM(CASE WHEN amount_idr IS NULL THEN 1 ELSE 0 END) AS null_amount,
+    SUM(CASE WHEN trx_hour IS NULL THEN 1 ELSE 0 END)   AS null_jam
+FROM silver.transactions;
+ 
+-- Outlier / invalid value
+SELECT * FROM silver.transactions
+WHERE amount_idr <= 0 OR trx_hour NOT BETWEEN 0 AND 23;
+ 
+-- Referential integrity
+SELECT DISTINCT t.account_id
+FROM silver.transactions t
+WHERE t.account_id NOT IN (SELECT account_id FROM silver.accounts);
+ 
+-- Kolom turunan (ekspektasi: 4 band; is_success hanya 0/1)
+SELECT jam_band, COUNT(*) AS jml FROM silver.transactions GROUP BY jam_band;
+SELECT is_success, COUNT(*) AS jml FROM silver.transactions GROUP BY is_success;
+ 
+-- Konsistensi flag vs status asal
+SELECT * FROM silver.transactions
+WHERE (status = 'success' AND is_success = 0)
+   OR (status <> 'success' AND is_success = 1);
+ 
+-- =========================================================
+-- silver.loans
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT loan_id, COUNT(*) AS jml
+FROM silver.loans
+GROUP BY loan_id
+HAVING COUNT(*) > 1 OR loan_id IS NULL;
+ 
+-- Outlier / invalid value
+SELECT * FROM silver.loans
+WHERE principal_idr <= 0
+   OR tenure_months <= 0
+   OR interest_rate_annual NOT BETWEEN 0 AND 1
+   OR outstanding_idr < 0;
+ 
+-- Structural error: urutan tanggal
+SELECT loan_id, disbursement_date, due_date, last_payment_date
+FROM silver.loans
+WHERE due_date < disbursement_date
+   OR last_payment_date < disbursement_date;
+ 
+-- Referential integrity
+SELECT DISTINCT l.customer_id
+FROM silver.loans l
+WHERE l.customer_id NOT IN (SELECT customer_id FROM silver.customers);
+ 
+-- Business logic: pinjaman hanya untuk nasabah verified
+SELECT l.loan_id, c.kyc_status
+FROM silver.loans l
+JOIN silver.customers c ON l.customer_id = c.customer_id
+WHERE c.kyc_status <> 'verified';
+ 
+-- Kolom turunan (ekspektasi: vintage_year masuk akal; is_npl hanya 0/1)
+SELECT vintage_year, COUNT(*) AS jml FROM silver.loans GROUP BY vintage_year;
+SELECT is_npl, COUNT(*) AS jml FROM silver.loans GROUP BY is_npl;
+ 
+-- =========================================================
+-- silver.cards
+-- =========================================================
+-- PK: NULL & duplikat
+SELECT card_id, COUNT(*) AS jml
+FROM silver.cards
+GROUP BY card_id
+HAVING COUNT(*) > 1 OR card_id IS NULL;
+ 
+-- Referential integrity
+SELECT DISTINCT k.customer_id
+FROM silver.cards k
+WHERE k.customer_id NOT IN (SELECT customer_id FROM silver.customers);
+ 
+SELECT DISTINCT k.account_id
+FROM silver.cards k
+WHERE k.account_id NOT IN (SELECT account_id FROM silver.accounts);
+ 
+-- Kolom turunan: utilisasi wajib NULL untuk debit, terisi untuk credit
+SELECT
+    card_type,
+    COUNT(*)                                                 AS jml,
+    SUM(CASE WHEN utilization_pct IS NULL THEN 1 ELSE 0 END) AS util_null,
+    MIN(utilization_pct)                                     AS min_util,
+    MAX(utilization_pct)                                     AS max_util
+FROM silver.cards
+GROUP BY card_type;
